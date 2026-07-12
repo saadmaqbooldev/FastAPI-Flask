@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Optional
+from statistics import mean
 
 app = FastAPI(
     title="Student Management API",
     description="CRUD API using Python List",
-    version="1.0"
+    version="1.2"
 )
 
 students = []
@@ -12,9 +14,16 @@ students = []
 
 class Student(BaseModel):
     id: int
-    name: str
-    age: int
-    course: str
+    name: str = Field(..., min_length=1, max_length=50)
+    age: int = Field(..., gt=0, lt=100)
+    course: str = Field(..., min_length=1)
+
+
+# For PATCH — every field optional so client can update just one at a time
+class StudentUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=50)
+    age: Optional[int] = Field(None, gt=0, lt=100)
+    course: Optional[str] = Field(None, min_length=1)
 
 
 # Home API
@@ -24,7 +33,7 @@ def home():
 
 
 # Create Student
-@app.post("/students")
+@app.post("/students", status_code=201)
 def add_student(student: Student):
     for s in students:
         if s["id"] == student.id:
@@ -38,10 +47,27 @@ def add_student(student: Student):
     }
 
 
-# Get All Students
+# Get All Students — with optional filtering & sorting
 @app.get("/students")
-def get_students():
-    return students
+def get_students(
+    course: Optional[str] = Query(None, description="Filter by course"),
+    min_age: Optional[int] = Query(None, description="Minimum age"),
+    max_age: Optional[int] = Query(None, description="Maximum age"),
+    sort_by: Optional[str] = Query(None, description="Sort by 'name' or 'age'"),
+):
+    result = students
+
+    if course:
+        result = [s for s in result if s["course"].lower() == course.lower()]
+    if min_age is not None:
+        result = [s for s in result if s["age"] >= min_age]
+    if max_age is not None:
+        result = [s for s in result if s["age"] <= max_age]
+
+    if sort_by in ("name", "age"):
+        result = sorted(result, key=lambda s: s[sort_by])
+
+    return {"count": len(result), "students": result}
 
 
 # Get Student By ID
@@ -54,9 +80,16 @@ def get_student(student_id: int):
     raise HTTPException(status_code=404, detail="Student Not Found")
 
 
-# Update Student
+# Update Student (Full Update — replaces all fields)
 @app.put("/students/{student_id}")
 def update_student(student_id: int, updated_student: Student):
+
+    # Block path/body ID mismatch (e.g. PUT /students/5 with body id=999)
+    if updated_student.id != student_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ID in URL ({student_id}) does not match ID in request body ({updated_student.id})"
+        )
 
     for index, student in enumerate(students):
 
@@ -67,6 +100,24 @@ def update_student(student_id: int, updated_student: Student):
             return {
                 "message": "Student Updated Successfully",
                 "student": updated_student
+            }
+
+    raise HTTPException(status_code=404, detail="Student Not Found")
+
+
+# Partial Update Student (only send the fields you want to change)
+@app.patch("/students/{student_id}")
+def partial_update_student(student_id: int, updates: StudentUpdate):
+
+    for student in students:
+        if student["id"] == student_id:
+
+            update_data = updates.model_dump(exclude_unset=True)
+            student.update(update_data)
+
+            return {
+                "message": "Student Updated Successfully",
+                "student": student
             }
 
     raise HTTPException(status_code=404, detail="Student Not Found")
@@ -86,14 +137,48 @@ def delete_student(student_id: int):
     raise HTTPException(status_code=404, detail="Student Not Found")
 
 
-# Search Student By Course
+# Delete All Students
+@app.delete("/students")
+def delete_all_students():
+    count = len(students)
+    students.clear()
+    return {"message": f"Deleted {count} students"}
+
+
+# Search Student By Course or Name (partial match, plus optional age range)
 @app.get("/search")
-def search_student(course: str = Query(..., description="Course Name")):
+def search_student(
+    course: Optional[str] = Query(None, description="Course Name"),
+    name: Optional[str] = Query(None, description="Student Name (partial match)"),
+    min_age: Optional[int] = Query(None),
+    max_age: Optional[int] = Query(None),
+):
+    result = students
 
-    result = []
-
-    for student in students:
-        if student["course"].lower() == course.lower():
-            result.append(student)
+    if course:
+        result = [s for s in result if s["course"].lower() == course.lower()]
+    if name:
+        result = [s for s in result if name.lower() in s["name"].lower()]
+    if min_age is not None:
+        result = [s for s in result if s["age"] >= min_age]
+    if max_age is not None:
+        result = [s for s in result if s["age"] <= max_age]
 
     return result
+
+
+# Stats — total students, avg age, count per course
+@app.get("/stats")
+def get_stats():
+    if not students:
+        return {"total_students": 0, "average_age": 0, "students_per_course": {}}
+
+    course_counts = {}
+    for s in students:
+        course_counts[s["course"]] = course_counts.get(s["course"], 0) + 1
+
+    return {
+        "total_students": len(students),
+        "average_age": round(mean(s["age"] for s in students), 1),
+        "students_per_course": course_counts,
+    }
